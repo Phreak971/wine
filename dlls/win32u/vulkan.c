@@ -28,6 +28,9 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <errno.h>
+#include <string.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -132,6 +135,11 @@ struct device_memory
     D3DKMT_HANDLE mutex;
     VkSemaphore semaphore;
     UINT64 semaphore_value;
+
+    /* exportable memory placed by 64-bit callers in slices, through its dma-buf */
+    BOOL exportable;
+    BOOL sliced;
+    int fd;
 };
 
 static inline struct device_memory *device_memory_from_handle( VkDeviceMemory handle )
@@ -1125,6 +1133,8 @@ static VkResult win32u_vkAllocateMemory( VkDevice client_device, const VkMemoryA
         return res;
 
     if (!(memory = calloc( 1, sizeof(*memory) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    memory->fd = -1;
+    memory->exportable = export_info != NULL;
 
     if (import_win32)
     {
@@ -1253,6 +1263,7 @@ static void win32u_vkFreeMemory( VkDevice client_device, VkDeviceMemory client_m
 
     device->p_vkFreeMemory( device->host.device, memory->obj.host.device_memory, NULL );
     instance->p_remove_object( instance, &memory->obj.obj );
+    if (memory->fd >= 0) close( memory->fd );
 
     if (memory->vm_map)
     {
@@ -1316,6 +1327,45 @@ static VkResult win32u_vkGetMemoryWin32HandlePropertiesKHR( VkDevice client_devi
     return VK_SUCCESS;
 }
 
+/* Places [offset, offset + size) of exportable memory at the caller's address by mapping its dma-buf there. The same
+ * memory may be placed any number of times, at any page-aligned offsets, so one allocation can back many addresses
+ * (and the same bytes can appear at several). Such slices are not unmapped through Vulkan: the caller returns the
+ * address range to its own reservation, which replaces the mapping. */
+static VkResult map_slice( struct vulkan_device *device, struct device_memory *memory, const VkMemoryMapInfoKHR *map_info,
+                           void *address, void **data )
+{
+    VkDeviceSize size = map_info->size == VK_WHOLE_SIZE ? memory->size - map_info->offset : map_info->size;
+    void *mapped;
+
+    if (map_info->offset >= memory->size || size > memory->size - map_info->offset) return VK_ERROR_MEMORY_MAP_FAILED;
+    if (memory->fd < 0)
+    {
+        VkMemoryGetFdInfoKHR get_fd_info = {.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
+        VkResult res;
+
+        get_fd_info.memory = memory->obj.host.device_memory;
+        get_fd_info.handleType = get_host_external_memory_type();
+        if (!device->p_vkGetMemoryFdKHR ||
+            (res = device->p_vkGetMemoryFdKHR( device->host.device, &get_fd_info, &memory->fd )))
+        {
+            ERR( "no dma-buf for placing a slice\n" );
+            memory->fd = -1;
+            return VK_ERROR_MEMORY_MAP_FAILED;
+        }
+    }
+    mapped = mmap( address, size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, memory->fd, map_info->offset );
+    if (mapped == MAP_FAILED)
+    {
+        ERR( "placing %#llx bytes at %p failed: %s\n", (unsigned long long)size, address, strerror( errno ) );
+        return VK_ERROR_MEMORY_MAP_FAILED;
+    }
+    memory->sliced = TRUE;
+    *data = mapped;
+    TRACE( "placed %#llx bytes at offset %#llx at %p\n", (unsigned long long)size, (unsigned long long)map_info->offset,
+           mapped );
+    return VK_SUCCESS;
+}
+
 static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMapInfoKHR *map_info, void **data )
 {
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
@@ -1327,6 +1377,16 @@ static VkResult win32u_vkMapMemory2KHR( VkDevice client_device, const VkMemoryMa
         .sType = VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT,
     };
     VkResult res;
+
+    if (physical_device->client_placed && memory->exportable && (map_info->flags & VK_MEMORY_MAP_PLACED_BIT_EXT))
+    {
+        const VkBaseInStructure *chain;
+
+        for (chain = map_info->pNext; chain; chain = chain->pNext)
+            if (chain->sType == VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT)
+                return map_slice( device, memory, map_info, ((const VkMemoryMapPlacedInfoEXT *)chain)->pPlacedAddress,
+                                  data );
+    }
 
     info.memory = memory->obj.host.device_memory;
     if (memory->vm_map)
@@ -1413,6 +1473,7 @@ static VkResult win32u_vkUnmapMemory2KHR( VkDevice client_device, const VkMemory
     VkResult res;
 
     if (memory->vm_map && physical_device->external_memory_align) return VK_SUCCESS;
+    if (memory->sliced) return VK_SUCCESS;
 
     if (!device->p_vkUnmapMemory2KHR)
     {
