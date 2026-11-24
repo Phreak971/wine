@@ -188,6 +188,8 @@ struct vulkan_physical_device
     VkPhysicalDeviceMemoryProperties memory_properties;
     uint32_t external_memory_align;
     uint32_t map_placed_align;
+    /* 64-bit callers may pass VkMemoryMapPlacedInfoEXT themselves */
+    uint32_t client_placed;
 };
 
 static inline struct vulkan_physical_device *vulkan_physical_device_from_handle( VkPhysicalDevice handle )

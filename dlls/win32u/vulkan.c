@@ -557,7 +557,7 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
     }
     physical_device->extensions = extensions;
 
-    if (zero_bits && physical_device->extensions.has_VK_EXT_map_memory_placed && physical_device->extensions.has_VK_KHR_map_memory2)
+    if (physical_device->extensions.has_VK_EXT_map_memory_placed && physical_device->extensions.has_VK_KHR_map_memory2)
     {
         VkPhysicalDeviceMapMemoryPlacedFeaturesEXT map_placed_feature = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT};
         VkPhysicalDeviceFeatures2 features = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &map_placed_feature};
@@ -569,8 +569,17 @@ static VkResult init_physical_device( struct vulkan_physical_device *physical_de
             VkPhysicalDeviceProperties2 props = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,.pNext = &map_placed_props};
 
             instance->p_vkGetPhysicalDeviceProperties2( host_physical_device, &props );
-            physical_device->map_placed_align = map_placed_props.minPlacedMemoryMapAlignment;
-            TRACE( "Using placed map with alignment %u\n", physical_device->map_placed_align );
+            if (zero_bits)
+            {
+                physical_device->map_placed_align = map_placed_props.minPlacedMemoryMapAlignment;
+                TRACE( "Using placed map with alignment %u\n", physical_device->map_placed_align );
+            }
+            else
+            {
+                physical_device->client_placed = 1;
+                TRACE( "Callers may place mappings, alignment %#llx\n",
+                       (unsigned long long)map_placed_props.minPlacedMemoryMapAlignment );
+            }
         }
     }
 
@@ -817,17 +826,24 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
     if (device->extensions.has_VK_EXT_external_memory_dma_buf)
         device->extensions.has_VK_KHR_external_memory_fd = 1;
 
-    if (physical_device->map_placed_align)
+    if (physical_device->map_placed_align || physical_device->client_placed)
     {
-        VkPhysicalDeviceMapMemoryPlacedFeaturesEXT *map_placed_features;
+        VkPhysicalDeviceMapMemoryPlacedFeaturesEXT *map_placed_features = NULL;
+        VkBaseOutStructure *chain;
 
-        if (!(map_placed_features = mem_alloc( pool, sizeof(*map_placed_features) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
-        map_placed_features->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT;
-        map_placed_features->pNext = (void *)info->pNext;
+        for (chain = (VkBaseOutStructure *)info->pNext; chain; chain = chain->pNext)
+            if (chain->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT)
+                map_placed_features = (VkPhysicalDeviceMapMemoryPlacedFeaturesEXT *)chain;
+        if (!map_placed_features)
+        {
+            if (!(map_placed_features = mem_alloc( pool, sizeof(*map_placed_features) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+            map_placed_features->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT;
+            map_placed_features->pNext = (void *)info->pNext;
+            map_placed_features->memoryMapRangePlaced = VK_FALSE;
+            info->pNext = map_placed_features;
+        }
         map_placed_features->memoryMapPlaced = VK_TRUE;
-        map_placed_features->memoryMapRangePlaced = VK_FALSE;
         map_placed_features->memoryUnmapReserve = VK_TRUE;
-        info->pNext = map_placed_features;
 
         device->extensions.has_VK_EXT_map_memory_placed = 1;
         device->extensions.has_VK_KHR_map_memory2 = 1;
