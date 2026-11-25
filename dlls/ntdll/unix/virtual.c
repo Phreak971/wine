@@ -1873,6 +1873,8 @@ static void unregister_view( struct file_view *view )
 }
 
 
+static void neurton_disarm_range( const void *base, size_t size, BOOL protect );
+
 /***********************************************************************
  *           delete_view
  *
@@ -1880,6 +1882,7 @@ static void unregister_view( struct file_view *view )
  */
 static void delete_view( struct file_view *view ) /* [in] View */
 {
+    neurton_disarm_range( view->base, view->size, FALSE );
     if (!(view->protect & VPROT_SYSTEM)) unmap_area( view->base, view->size );
     set_page_vprot( view->base, view->size, 0 );
     if (view->protect & VPROT_ARM64EC) clear_arm64ec_range( view->base, view->size );
@@ -2032,6 +2035,53 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
 }
 
 
+/* Neurton: 64K blocks can be armed, which takes write access from their plain writable pages without touching the
+ * per-page protections, so that it is independent of write watches. The first write to an armed block disarms it and
+ * appends its address to a ring that the process reads. virtual_mutex protects all of this. */
+#define NEURTON_WATCH_BLOCK 0x10000
+#define NEURTON_WATCH_BLOCKS ((size_t)1 << 31)
+
+struct neurton_watch_ring
+{
+    LONG64 head;
+    LONG64 capacity;
+    UINT64 pages[1];
+};
+
+static struct neurton_watch_ring *neurton_watch_ring;
+static UINT64 *neurton_armed_bits, *neurton_watched_bits;
+
+static BOOL neurton_test_range( const UINT64 *bits, const void *base, size_t size )
+{
+    size_t block = (UINT_PTR)base / NEURTON_WATCH_BLOCK, end = ((UINT_PTR)base + size + NEURTON_WATCH_BLOCK - 1) / NEURTON_WATCH_BLOCK;
+
+    if (!bits || !size) return FALSE;
+    end = min( end, NEURTON_WATCH_BLOCKS );
+    while (block < end)
+    {
+        if (!(block % 64) && !bits[block / 64]) block += 64;
+        else if (bits[block / 64] >> (block % 64) & 1) return TRUE;
+        else block++;
+    }
+    return FALSE;
+}
+
+static BOOL is_neurton_watchable( BYTE vprot )
+{
+    return (vprot & VPROT_WRITE) && !(vprot & (VPROT_EXEC | VPROT_WRITECOPY | VPROT_GUARD));
+}
+
+/* the protection of a page at an address: like get_unix_prot, but armed blocks are not writable */
+static int get_unix_prot_at( const void *addr, BYTE vprot )
+{
+    int prot = get_unix_prot( vprot );
+
+    if ((prot & PROT_WRITE) && is_neurton_watchable( vprot ) && neurton_test_range( neurton_armed_bits, addr, 1 ))
+        prot &= ~PROT_WRITE;
+    return prot;
+}
+
+
 /***********************************************************************
  *           mprotect_range
  *
@@ -2047,11 +2097,11 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
     size = ROUND_SIZE( base, size, host_page_mask );
 
     vprot = get_host_page_vprot( addr );
-    prot = get_unix_prot( (vprot & ~clear) | set );
+    prot = get_unix_prot_at( addr, (vprot & ~clear) | set );
     for (count = i = 1; i < size / host_page_size; i++, count++)
     {
         vprot = get_host_page_vprot( addr + count * host_page_size );
-        next = get_unix_prot( (vprot & ~clear) | set );
+        next = get_unix_prot_at( addr + count * host_page_size, (vprot & ~clear) | set );
         if (next == prot) continue;
         if (mprotect_exec( addr, count * host_page_size, prot )) return -1;
         addr += count * host_page_size;
@@ -2062,6 +2112,95 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
 }
 
 
+/* update the protections of the watchable pages of whole blocks */
+static void neurton_protect_blocks( char *base, char *end )
+{
+    char *page, *run = NULL;
+
+    for (page = base; page <= end; page += host_page_size)
+    {
+        BOOL watchable = page < end && is_neurton_watchable( get_host_page_vprot( page ));
+
+        if (watchable && !run) run = page;
+        else if (!watchable && run)
+        {
+            mprotect_range( run, page - run, 0, 0 );
+            run = NULL;
+        }
+    }
+}
+
+/* report and disarm the blocks of a range */
+static void neurton_disarm_range( const void *base, size_t size, BOOL protect )
+{
+    size_t block = (UINT_PTR)base / NEURTON_WATCH_BLOCK, end = ((UINT_PTR)base + size + NEURTON_WATCH_BLOCK - 1) / NEURTON_WATCH_BLOCK;
+
+    if (!neurton_test_range( neurton_armed_bits, base, size )) return;
+    end = min( end, NEURTON_WATCH_BLOCKS );
+    for ( ; block < end; block++)
+    {
+        struct neurton_watch_ring *ring = neurton_watch_ring;
+        char *addr = (char *)(block * NEURTON_WATCH_BLOCK);
+
+        if (!(neurton_armed_bits[block / 64] >> (block % 64) & 1)) continue;
+        neurton_armed_bits[block / 64] &= ~((UINT64)1 << (block % 64));
+        if (protect) neurton_protect_blocks( addr, addr + NEURTON_WATCH_BLOCK );
+        ring->pages[ring->head % ring->capacity] = (UINT_PTR)addr;
+        __atomic_store_n( &ring->head, ring->head + 1, __ATOMIC_RELEASE );
+    }
+}
+
+static NTSTATUS neurton_arm_ranges( ULONG_PTR count, const MEMORY_RANGE_ENTRY *ranges )
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    sigset_t sigset;
+    ULONG_PTR i;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    for (i = 0; i < count && !status; i++)
+    {
+        size_t block = (UINT_PTR)ranges[i].VirtualAddress / NEURTON_WATCH_BLOCK;
+        size_t end = ((UINT_PTR)ranges[i].VirtualAddress + ranges[i].NumberOfBytes + NEURTON_WATCH_BLOCK - 1) / NEURTON_WATCH_BLOCK;
+        char *start = (char *)(block * NEURTON_WATCH_BLOCK);
+
+        if (end > NEURTON_WATCH_BLOCKS)
+        {
+            status = STATUS_NOT_SUPPORTED;
+            break;
+        }
+        for ( ; block < end; block++)
+        {
+            neurton_armed_bits[block / 64] |= (UINT64)1 << (block % 64);
+            neurton_watched_bits[block / 64] |= (UINT64)1 << (block % 64);
+        }
+        neurton_protect_blocks( start, (char *)(end * NEURTON_WATCH_BLOCK) );
+    }
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    return status;
+}
+
+static NTSTATUS neurton_set_watch_ring( struct neurton_watch_ring *ring )
+{
+    const size_t bytes = NEURTON_WATCH_BLOCKS / 8;
+    NTSTATUS status = STATUS_SUCCESS;
+    sigset_t sigset;
+    void *bits;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    if (neurton_watch_ring) status = STATUS_ALREADY_REGISTERED;
+    else if ((bits = mmap( NULL, 2 * bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0 )) == MAP_FAILED)
+        status = STATUS_NO_MEMORY;
+    else
+    {
+        neurton_watch_ring = ring;
+        neurton_watched_bits = (UINT64 *)((char *)bits + bytes);
+        neurton_armed_bits = bits;
+    }
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    return status;
+}
+
+
 /***********************************************************************
  *           set_vprot
  *
@@ -2069,6 +2208,7 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
  */
 static BOOL set_vprot( struct file_view *view, void *base, size_t size, BYTE vprot )
 {
+    neurton_disarm_range( base, size, TRUE );
     if (!use_kernel_writewatch && view->protect & VPROT_WRITEWATCH)
     {
         /* each page may need different protections depending on write watch flag */
@@ -4915,6 +5055,7 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
     }
     else if (err == EXCEPTION_WRITE_FAULT)
     {
+        neurton_disarm_range( page, host_page_size, TRUE );
         if (vprot & VPROT_WRITEWATCH)
         {
             if (enable_write_exceptions && is_vprot_exec_write( vprot ) && !ntdll_get_thread_data()->allow_writes)
@@ -4932,7 +5073,8 @@ NTSTATUS virtual_handle_fault( EXCEPTION_RECORD *rec, void *stack )
         /* ignore fault if page is writable now */
         if (get_unix_prot( get_host_page_vprot( page )) & PROT_WRITE)
         {
-            if ((vprot & VPROT_WRITEWATCH) || is_write_watch_range( page, 1 ))
+            if ((vprot & VPROT_WRITEWATCH) || is_write_watch_range( page, 1 ) ||
+                (is_neurton_watchable( vprot ) && neurton_test_range( neurton_watched_bits, page, 1 )))
                 ret = STATUS_SUCCESS;
         }
     }
@@ -5004,6 +5146,7 @@ static NTSTATUS check_write_access( void *base, size_t size, BOOL *has_write_wat
     char *addr = ROUND_ADDR( base, host_page_mask );
 
     size = ROUND_SIZE( base, size, host_page_mask );
+    neurton_disarm_range( addr, size, TRUE );
     for (i = 0; i < size; i += host_page_size)
     {
         BYTE vprot = get_host_page_vprot( addr + i );
@@ -5043,6 +5186,29 @@ unsigned int virtual_locked_server_call( void *req_ptr )
 }
 
 
+/* Neurton: a read that stops at a page that cannot be written is short, not an error */
+static ssize_t neurton_finish_read( int fd, char *addr, size_t size, off_t offset, ssize_t done )
+{
+    BOOL has_write_watch = FALSE;
+    ssize_t more = 0;
+    struct stat st;
+    sigset_t sigset;
+
+    if (!neurton_test_range( neurton_watched_bits, addr + done, size - done )) return done;
+    if (fstat( fd, &st ) || !S_ISREG( st.st_mode )) return done;
+
+    server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+    if (!check_write_access( addr + done, size - done, &has_write_watch ))
+    {
+        if (offset == -1) more = read( fd, addr + done, size - done );
+        else more = pread( fd, addr + done, size - done, offset + done );
+        if (has_write_watch) update_write_watches( addr + done, size - done, max( 0, more ));
+    }
+    server_leave_uninterrupted_section( &virtual_mutex, &sigset );
+    return done + max( 0, more );
+}
+
+
 /***********************************************************************
  *           virtual_locked_read
  */
@@ -5053,7 +5219,8 @@ ssize_t virtual_locked_read( int fd, void *addr, size_t size )
     int err = EFAULT;
 
     ssize_t ret = read( fd, addr, size );
-    if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+    if (ret > 0 && (size_t)ret < size) return neurton_finish_read( fd, addr, size, -1, ret );
+    if (ret != -1 || (use_kernel_writewatch && !neurton_watch_ring) || errno != EFAULT) return ret;
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     if (!check_write_access( addr, size, &has_write_watch ))
@@ -5078,7 +5245,8 @@ ssize_t virtual_locked_pread( int fd, void *addr, size_t size, off_t offset )
     int err = EFAULT;
 
     ssize_t ret = pread( fd, addr, size, offset );
-    if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+    if (ret > 0 && (size_t)ret < size) return neurton_finish_read( fd, addr, size, offset, ret );
+    if (ret != -1 || (use_kernel_writewatch && !neurton_watch_ring) || errno != EFAULT) return ret;
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     if (!check_write_access( addr, size, &has_write_watch ))
@@ -5104,7 +5272,7 @@ ssize_t virtual_locked_recvmsg( int fd, struct msghdr *hdr, int flags )
     int err = EFAULT;
 
     ssize_t ret = recvmsg( fd, hdr, flags );
-    if (ret != -1 || use_kernel_writewatch || errno != EFAULT) return ret;
+    if (ret != -1 || (use_kernel_writewatch && !neurton_watch_ring) || errno != EFAULT) return ret;
 
     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
     for (i = 0; i < hdr->msg_iovlen; i++)
@@ -7349,6 +7517,25 @@ NTSTATUS WINAPI NtSetInformationVirtualMemory( HANDLE process,
 {
     TRACE("(%p, info_class=%d, %lu, %p, %p, %u)\n",
           process, info_class, count, addresses, ptr, size);
+
+    /* Neurton: private classes */
+    switch ((ULONG)info_class)
+    {
+    case 0x4e580001:  /* ring of written blocks */
+    {
+        struct neurton_watch_ring *ring = ptr;
+
+        if (process != GetCurrentProcess()) return STATUS_NOT_SUPPORTED;
+        if (!ring || size < sizeof(*ring)) return STATUS_INVALID_PARAMETER_5;
+        if (ring->capacity <= 0 || ring->capacity > (size - offsetof( struct neurton_watch_ring, pages )) / sizeof(UINT64))
+            return STATUS_INVALID_PARAMETER_6;
+        return neurton_set_watch_ring( ring );
+    }
+    case 0x4e580002:  /* arm ranges */
+        if (process != GetCurrentProcess()) return STATUS_NOT_SUPPORTED;
+        if (!neurton_watch_ring) return STATUS_INVALID_DEVICE_STATE;
+        return neurton_arm_ranges( count, addresses );
+    }
 
     switch (info_class)
     {
